@@ -1,22 +1,29 @@
 # -*- coding: utf-8 -*-
-
+import json
 import os
+import urllib.parse
+from typing import Dict
 import flask
 import requests
-
-import google.oauth2.credentials
-import google_auth_oauthlib.flow
-import googleapiclient.discovery
+from requests.auth import HTTPBasicAuth
 
 # This variable specifies the name of a file that contains the OAuth 2.0
 # information for this application, including its client_id and client_secret.
 CLIENT_SECRETS_FILE = "client_secret.json"
 
+with open(CLIENT_SECRETS_FILE, "r", encoding='UTF-8') as f:
+    secrets = json.loads(f.read())
+    CLIENT_ID = secrets["web"]["client_id"]
+    CLIENT_SECRET = secrets["web"]["client_secret"]
+
 # This OAuth 2.0 access scope allows for full read/write access to the
 # authenticated user's account and requires requests to use an SSL connection.
-SCOPES = ['https://www.googleapis.com/auth/youtube.readonly']
+SCOPES = ['email', 'openid',
+          'https://www.googleapis.com/auth/drive.readonly',
+          'https://www.googleapis.com/auth/youtube.readonly']
 
 app = flask.Flask(__name__)
+
 # Note: A secret key is included in the sample so that it works.
 # If you use this code in your application, replace this with a truly secret
 # key. See https://flask.palletsprojects.com/quickstart/#sessions.
@@ -30,65 +37,66 @@ def index():
 
 @app.route('/test')
 def test_api_request():
-    if 'credentials' not in flask.session:
+    if 'token' not in flask.session:
         return flask.redirect('login')
 
-    # Load credentials from the session.
-    credentials = google.oauth2.credentials.Credentials(
-        **flask.session['credentials'])
-
-    # drive = googleapiclient.discovery.build(
-    #     API_SERVICE_NAME, API_VERSION, credentials=credentials)
-    #
-    # files = drive.files().list().execute()
-
-    # Create youtube client using google api client
-    youtube = googleapiclient.discovery.build(
-        'youtube', 'v3', credentials=credentials)
+    token = flask.session['token']
 
     # Get ALL the subscriptions from ALL the pages from the current user
     # 'https://youtube.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=50&alt=json'
-    request = youtube.subscriptions().list(part="snippet", mine=True, maxResults=50)
-    response = request.execute()
-    items = response.get('items', [])
+    # request = youtube.subscriptions().list(part="snippet", mine=True, maxResults=50)
+    # response = request.execute()
+    response = requests.get(
+        url='https://youtube.googleapis.com/youtube/v3/subscriptions',
+        params={
+            'part': 'snippet',
+            'mine': 'true',
+            'maxResults': '50',
+            'alt': 'json'
+        },
+        headers={'content-type': 'application/json', 'Authorization': f'Bearer {token}'},
+    )
+    items = response.json().get('items', [])
 
     # Get the next page of results if there is one
-    while 'nextPageToken' in response:
-        page_token = response['nextPageToken']
-        request = youtube.subscriptions().list(part="snippet", mine=True, maxResults=50, pageToken=page_token)
-        response = request.execute()
-        items = items + response['items']
+    while 'nextPageToken' in response.json():
+        page_token = response.json()['nextPageToken']
+        response = requests.get(
+            url='https://youtube.googleapis.com/youtube/v3/subscriptions',
+            params={
+                'part': 'snippet',
+                'mine': 'true',
+                'maxResults': '50',
+                'alt': 'json',
+                'pageToken': page_token
+            },
+            headers={'content-type': 'application/json', 'Authorization': f'Bearer {token}'},
+        )
+        items = items + response.json().get('items', [])
 
     # List the name of the subscriptions
     subscriptions = [item['snippet']['title'] for item in items]
-
-    # Save credentials back to session in case access token was refreshed.
-    # ACTION ITEM: In a production app, you likely want to save these
-    #              credentials in a persistent database instead.
-    flask.session['credentials'] = credentials_to_dict(credentials)
 
     return flask.jsonify({"titles": subscriptions})
 
 
 @app.route('/login')
 def login():
-    # Create flow instance to manage the OAuth 2.0 Authorization Grant Flow steps.
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES)
-
     # The URI created here must exactly match one of the authorized redirect URIs
     # for the OAuth 2.0 client, which you configured in the API Console. If this
     # value doesn't match an authorized URI, you will get a 'redirect_uri_mismatch'
     # error.
-    flow.redirect_uri = flask.url_for('auth', _external=True)
-
-    authorization_url, _ = flow.authorization_url(
-        # Enable offline access so that you can refresh an access token without
-        # re-prompting the user for permission. Recommended for web server apps.
-        access_type='offline',
-        # Enable incremental authorization. Recommended as a best practice.
-        include_granted_scopes='true')
-
+    google_oauth_url = "https://accounts.google.com/o/oauth2/auth"
+    query_params: Dict[str, str] = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": "http://localhost:9000/auth",
+        "scope": " ".join(SCOPES),
+        "state": "ETL04Oop9e1yFQQFRM2KpHvbWwtMRV",
+        "access_type": "offline",
+        "include_granted_scopes": "true"
+    }
+    authorization_url = f"{google_oauth_url}?{urllib.parse.urlencode(query_params)}"
     return flask.redirect(authorization_url)
 
 
@@ -96,23 +104,18 @@ def login():
 def auth():
     # Parse query parameters to dictionary
     params = flask.request.args.to_dict()
-    print(params)
 
-    state = params['state']
+    token_response = requests.post('https://oauth2.googleapis.com/token',
+                                   auth=HTTPBasicAuth(CLIENT_ID, CLIENT_SECRET),
+                                   params={
+                                       'grant_type': "authorization_code",
+                                       "code": params["code"],
+                                       "redirect_uri": "http://localhost:9000/auth"
+                                   },
+                                   headers={'content-type': 'application/json'})
 
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES, state=state)
-    flow.redirect_uri = flask.url_for('auth', _external=True)
-
-    # Use the authorization server's response to fetch the OAuth 2.0 tokens.
-    authorization_response = flask.request.url
-    flow.fetch_token(authorization_response=authorization_response)
-
-    # Store credentials in the session.
-    # ACTION ITEM: In a production app, you likely want to save these
-    #              credentials in a persistent database instead.
-    credentials = flow.credentials
-    flask.session['credentials'] = credentials_to_dict(credentials)
+    print(token_response.json().get('refresh_token', 'No refresh token'))
+    flask.session['token'] = token_response.json()['access_token']
 
     return flask.redirect(flask.url_for('test_api_request'))
 
@@ -123,11 +126,10 @@ def revoke():
         return ('You need to <a href="/login">login</a> before ' +
                 'testing the code to revoke credentials.')
 
-    credentials = google.oauth2.credentials.Credentials(
-        **flask.session['credentials'])
+    token = flask.session['token']
 
     revoke_response = requests.post('https://oauth2.googleapis.com/revoke',
-                                    params={'token': credentials.token},
+                                    params={'token': token},
                                     headers={'content-type': 'application/x-www-form-urlencoded'})
 
     status_code = getattr(revoke_response, 'status_code')
@@ -138,19 +140,10 @@ def revoke():
 
 @app.route('/clear')
 def clear_credentials():
-    if 'credentials' in flask.session:
-        del flask.session['credentials']
+    if 'token' in flask.session:
+        del flask.session['token']
     return ('Credentials have been cleared.<br><br>' +
             print_index_table())
-
-
-def credentials_to_dict(credentials):
-    return {'token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'token_uri': credentials.token_uri,
-            'client_id': credentials.client_id,
-            'client_secret': credentials.client_secret,
-            'scopes': credentials.scopes}
 
 
 def print_index_table():
